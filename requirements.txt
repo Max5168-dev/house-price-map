@@ -1,0 +1,7 @@
+streamlit
+pandas
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+geopy
+plotly
