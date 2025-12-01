@@ -47,58 +47,85 @@ def get_gcp_credentials():
 # --------------------------------------------------
 # 讀取 Google Drive CSV 並快取
 # --------------------------------------------------
-@st.cache_data(show_spinner=True)
-def load_real_price_data():
-    """
-    1. 連線 Google Drive，搜尋指定 Folder ID 底下所有 .csv 檔
-    2. 逐檔下載後以 pd.read_csv(io.BytesIO(content), header=1) 讀取
-    3. 使用 pd.concat 合併
-    """
-    creds = get_gcp_credentials()
-    drive_service = build("drive", "v3", credentials=creds)
+# ... (前面的 import 保持不變)
 
-    query = (
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
-        "and mimeType='text/csv' and trashed=false"
+@st.cache_data(ttl=600)  # 設定快取，避免每次操作都重新下載
+def load_data_from_drive():
+    # 1. 建立 Drive 服務
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
     )
+    service = build('drive', 'v3', credentials=creds)
+    
+    # 您的母資料夾 ID
+    root_folder_id = "1yJsdqcJS9ux-EQsyD9G4qasr_kCERXt5"
+    
+    all_csv_files = []
+    
+    # === 關鍵修改：使用堆疊 (Stack) 進行遞迴搜尋 ===
+    # 這就像是一個待辦清單，一開始只有母資料夾
+    folders_to_search = [root_folder_id]
+    
+    st.write("📂 開始掃描 Google Drive 資料夾與子目錄...")
+    
+    while folders_to_search:
+        current_folder_id = folders_to_search.pop() # 取出一個資料夾來檢查
+        
+        try:
+            # 搜尋這個資料夾底下的所有東西 (包含檔案與子資料夾)
+            query = f"'{current_folder_id}' in parents and trashed = false"
+            results = service.files().list(
+                q=query, 
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=1000
+            ).execute()
+            items = results.get('files', [])
+            
+            for item in items:
+                # 如果是「資料夾」，就把它加入待辦清單，下次繼續往下查
+                if item['mimeType'] == 'application/vnd.google-apps.folder':
+                    folders_to_search.append(item['id'])
+                    # (選擇性) 可以在畫面上印出找到子資料夾
+                    # st.write(f"  ↪ 發現子資料夾: {item['name']}")
+                
+                # 如果是「CSV 檔案」，就把它加入下載清單
+                elif '.csv' in item['name'] or item['mimeType'] == 'text/csv':
+                    all_csv_files.append(item)
+                    
+        except Exception as e:
+            st.warning(f"⚠️ 讀取資料夾 {current_folder_id} 時發生錯誤: {e}")
+            continue
 
-    files = []
-    page_token = None
-    while True:
-        response = (
-            drive_service.files()
-            .list(
-                q=query,
-                spaces="drive",
-                fields="nextPageToken, files(id, name)",
-                pageToken=page_token,
-            )
-            .execute()
-        )
-        files.extend(response.get("files", []))
-        page_token = response.get("nextPageToken", None)
-        if page_token is None:
-            break
+    if not all_csv_files:
+        st.error("❌ 找不到任何 CSV 檔案！請確認您的檔案權限與位置。")
+        return pd.DataFrame() # 回傳空表
 
-    if not files:
-        raise RuntimeError("指定的 Google Drive 資料夾內沒有找到任何 CSV 檔案。")
+    st.success(f"✅ 共找到 {len(all_csv_files)} 個 CSV 檔案，開始合併...")
 
-    dataframes = []
-    for f in files:
-        file_id = f["id"]
-        file_name = f["name"]
-        # 下載檔案內容（bytes）
-        content = (
-            drive_service.files().get_media(fileId=file_id).execute()
-        )  # bytes
-        # 內政部檔案第 0 列為說明，第 1 列才是標題
-        df = pd.read_csv(io.BytesIO(content), header=1)
-        df["來源檔案"] = file_name
-        dataframes.append(df)
+    # === 下載並合併所有 CSV ===
+    df_list = []
+    for file in all_csv_files:
+        try:
+            # 下載檔案內容
+            request = service.files().get_media(fileId=file['id'])
+            file_content = io.BytesIO(request.execute())
+            
+            # 讀取 CSV (忽略第一列英文標題)
+            # 注意：如果您的檔案格式不同，可能需要調整 header=1
+            current_df = pd.read_csv(file_content, header=1)
+            df_list.append(current_df)
+            
+        except Exception as e:
+            st.warning(f"⚠️ 無法讀取檔案 {file['name']}: {e}")
 
-    combined_df = pd.concat(dataframes, ignore_index=True)
-    return combined_df
+    if df_list:
+        final_df = pd.concat(df_list, ignore_index=True)
+        return final_df
+    else:
+        return pd.DataFrame()
 
+# ... (後面的 UI 程式碼保持不變)
 
 # --------------------------------------------------
 # 資料清洗與衍生欄位
